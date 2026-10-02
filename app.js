@@ -1061,48 +1061,64 @@ function stopPttCapture() {
     // Check real acoustic vocal energy detected by the microphone AnalyserNode
     const userActuallySpoke = state.voicedFramesCount >= 2 || state.maxAudioDeviation > 8;
 
-    // If online Web Speech API returned nothing (offline mode, airplane mode, or network disconnected)
+    // If STT returned nothing but mic detected real voice energy —
+    // DO NOT auto-pick a default message. Ask the user to provide input instead.
     if (!capturedText && userActuallySpoke) {
-      // Local Offline On-Device ASR (Simulating on-device INT8 Conformer inference without cloud)
-      const corpus = OFFLINE_EMERGENCY_CORPUS[state.activeLang] || OFFLINE_EMERGENCY_CORPUS['te-IN'];
-      const pickIdx = (Math.round(state.lastRecordedDuration * 3) + Math.round(state.maxAudioDeviation)) % corpus.length;
-      capturedText = corpus[pickIdx];
-      state.isUsingOfflineAsrFallback = true;
+      const sttBox = document.getElementById('sttRecognizedBox');
+      const manualInput = document.getElementById('manualTextInput');
+      const actionsRow = document.getElementById('sttActionsRow');
+
+      if (sttBox) {
+        sttBox.innerHTML = `
+          <span style="color:#f59e0b; font-weight:700;">⚠ Couldn't hear you clearly.</span>
+          <br>
+          <span style="color:#94a3b8; font-size:0.8rem;">
+            Please <strong style="color:#38bdf8;">type your message</strong> in the box below and press <strong style="color:#06b6d4;">Send</strong>,
+            or press <strong style="color:#10b981;">↺ Retake</strong> to speak again.
+          </span>`;
+      }
+
+      // Show the actions row (Retake button) so user can retry
+      if (actionsRow) actionsRow.style.display = 'flex';
+
+      // Focus the manual input field so user can type immediately
+      if (manualInput) {
+        manualInput.focus();
+        manualInput.placeholder = LANG_MAP[state.activeLang]?.promptDefault || 'Type your message here...';
+      }
+
+      // Reset pending text — no auto-message
+      state.currentSttPendingText = '';
+      return;
     }
 
     // VAD Check: If user held the button but microphone was completely silent
     if (!capturedText || !userActuallySpoke) {
       const sttBox = document.getElementById('sttRecognizedBox');
       if (sttBox) {
-        sttBox.innerHTML = '<span style="color:#ef4444;">❌ VAD Silence Gate: Microphone heard no voice! (Microphone was silent). Hold button and speak clearly into mic.</span>';
+        sttBox.innerHTML = '<span style="color:#ef4444;">❌ Microphone was silent — hold the button and speak clearly into the mic.</span>';
       }
       return;
     }
 
-    console.log(`[iTantra-Trace] STT_COMPLETED (text="${capturedText}", offline=${state.isUsingOfflineAsrFallback})`);
+    console.log(`[iTantra-Trace] STT_COMPLETED (text="${capturedText}", lang=${state.activeLang})`);
 
     const sttBox = document.getElementById('sttRecognizedBox');
     const confBadge = document.getElementById('confidenceBadge');
     const actionsRow = document.getElementById('sttActionsRow');
 
+    // Store transcribed text and show confirm/retry/edit actions — user must confirm before sending
     state.currentSttPendingText = capturedText;
     if (actionsRow) {
       actionsRow.style.display = 'flex';
     }
 
     if (sttBox) {
-      if (state.isUsingOfflineAsrFallback) {
-        sttBox.innerHTML = `🟢 <strong style="color:#38bdf8;">[OFFLINE ON-DEVICE STT]</strong> "${capturedText}" <span style="font-size:0.75rem; color:#10b981;">(Zero Internet)</span>`;
-        if (confBadge) {
-          confBadge.textContent = 'Conf: 94% (Offline)';
-          confBadge.classList.remove('low-conf');
-        }
-      } else {
-        sttBox.innerHTML = `🎯 <strong>Captured:</strong> "${capturedText}"`;
-      }
+      sttBox.innerHTML = `🎯 <strong>Captured:</strong> "${capturedText}"`;
     }
 
-    processOutgoingUtterance(capturedText, state.lastRecordedDuration);
+    // Do NOT auto-send — wait for user to press "Confirm & Transmit"
+    // processOutgoingUtterance is called by btnConfirmSend click handler
   }, 350);
 }
 
