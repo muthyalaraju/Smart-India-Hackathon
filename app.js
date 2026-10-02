@@ -30,6 +30,9 @@ const state = {
   micStream: null,
   speechRecognition: null,
   speechSynth: window.speechSynthesis || null,
+  voicesCache: [],          // populated via voiceschanged event
+  lastSpokenText: '',       // for REPLAY LAST SPOKEN MESSAGE
+  lastSpokenLang: 'te-IN', // for REPLAY LAST SPOKEN MESSAGE
 
   // Queue & Cumulative Telemetry
   storeAndForwardQueue: [],
@@ -285,6 +288,7 @@ const DECK_SLIDES = [
 document.addEventListener('DOMContentLoaded', () => {
   initAudioSystem();
   initSpeechRecognition();
+  initTTS();
   initUIEventListeners();
   initNetworking();
   initVisualScopes();
@@ -480,6 +484,31 @@ function initSpeechRecognition() {
     if (sttBox) {
       sttBox.textContent = 'Note: Browser STT not supported. Use quick preset buttons or type below!';
     }
+  }
+}
+
+// =============================================================================
+// 1b. TTS VOICE CACHE INITIALIZER (must run early so voices are ready)
+// =============================================================================
+function initTTS() {
+  if (!state.speechSynth) {
+    console.warn('[iTantra-TTS] window.speechSynthesis not available in this browser.');
+    const speakerIndicator = document.getElementById('rxSpeakerIndicator');
+    if (speakerIndicator) speakerIndicator.textContent = 'TTS UNSUPPORTED';
+    return;
+  }
+
+  // Populate voices cache immediately (may return populated array in Firefox/Safari)
+  const loadVoices = () => {
+    const v = state.speechSynth.getVoices();
+    if (v.length > 0) state.voicesCache = v;
+  };
+
+  loadVoices();
+
+  // Chrome fires voiceschanged asynchronously; listen for it
+  if (typeof state.speechSynth.onvoiceschanged !== 'undefined') {
+    state.speechSynth.onvoiceschanged = loadVoices;
   }
 }
 
@@ -818,10 +847,12 @@ function initUIEventListeners() {
     });
   }
 
-  // Audio Replay Button
+  // Audio Replay Button — re-speaks the last decoded message (user-triggered, always works)
   if (replayBtn) {
     replayBtn.addEventListener('click', () => {
-      if (state.lastReceivedPacket) {
+      if (state.lastSpokenText) {
+        synthesizeSpeechReceiver(state.lastSpokenText, state.lastSpokenLang);
+      } else if (state.lastReceivedPacket) {
         synthesizeSpeechReceiver(state.lastReceivedPacket.text, state.lastReceivedPacket.lang);
       } else {
         synthesizeSpeechReceiver('స్పీకర్ సిద్ధంగా ఉంది. సందేశం కోసం వేచి చూస్తోంది.', state.activeLang);
@@ -1508,11 +1539,18 @@ function drainStoreAndForwardQueue() {
   }
 }
 
-// =============================================================================
-// 7. RECEIVER SPEECH SYNTHESIS (OFFLINE TTS VOCODER)
+// 7. RECEIVER SPEECH SYNTHESIS (BROWSER WEB SPEECH API TTS)
 // =============================================================================
 function synthesizeSpeechReceiver(text, lang, isAlertOrSos = false) {
-  if (!state.speechSynth) return;
+  if (!state.speechSynth) {
+    console.warn('[iTantra-TTS] speechSynthesis unavailable in this browser.');
+    return;
+  }
+
+  if (!text || !text.trim()) {
+    console.warn('[iTantra-TTS] Empty text — skipped.');
+    return;
+  }
 
   // Emergency non-interruptible lock: If high priority alert is vocalizing, do not cancel
   if (state.isAlertPlaying && !isAlertOrSos) {
@@ -1520,9 +1558,18 @@ function synthesizeSpeechReceiver(text, lang, isAlertOrSos = false) {
     return;
   }
 
+  // Store for REPLAY LAST SPOKEN MESSAGE button
+  state.lastSpokenText = text;
+  state.lastSpokenLang = lang || state.activeLang;
+
+  const speakerIndicator = document.getElementById('rxSpeakerIndicator');
+
+  // Cancel any currently speaking utterance to prevent overlap
   try {
     state.speechSynth.cancel();
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[iTantra-TTS] cancel() failed:', e);
+  }
 
   state.isSpeaking = true;
   if (isAlertOrSos) {
@@ -1530,47 +1577,82 @@ function synthesizeSpeechReceiver(text, lang, isAlertOrSos = false) {
     playEmergencyChime();
   }
 
-  const speakerIndicator = document.getElementById('rxSpeakerIndicator');
   if (speakerIndicator) {
     speakerIndicator.textContent = isAlertOrSos ? '🚨 VOCALIZING EMERGENCY ALERT (MAX VOL)' : '● VOCALIZING SPEECH';
     speakerIndicator.style.color = isAlertOrSos ? '#ef4444' : '#10b981';
   }
 
+  // Pass Indian-language Unicode text directly — no transliteration
   const cleanText = text.replace(/\*\*\*\[NOISE\]\*\*\*/g, 'noise');
-  const utterance = new SpeechSynthesisUtterance(cleanText);
-  utterance.lang = lang || state.activeLang;
-  utterance.rate = 0.95;
-  // Emergency alerts MUST play at maximum volume (1.0) per requirement 2
-  utterance.volume = isAlertOrSos ? 1.0 : 0.85;
+  const targetLang = lang || state.activeLang;
 
-  console.log(`[iTantra-Trace] TTS_STARTED (text="${cleanText}", lang=${utterance.lang})`);
+  // 120ms delay after cancel() before speak() — required to avoid Chrome's silent swallow bug
+  // where speak() queued synchronously right after cancel() never fires its onstart/onend.
+  setTimeout(() => {
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.lang = targetLang;
+    utterance.rate = 0.95;
+    // Emergency alerts MUST play at maximum volume (1.0)
+    utterance.volume = isAlertOrSos ? 1.0 : 0.85;
 
-  // Try selecting matching Indic voice if available in client OS
-  const voices = state.speechSynth.getVoices();
-  const matchedVoice = voices.find(v => v.lang.startsWith((lang || 'te').substring(0, 2)));
-  if (matchedVoice) utterance.voice = matchedVoice;
-
-  utterance.onend = () => {
-    state.isSpeaking = false;
-    state.isAlertPlaying = false;
-    console.log(`[iTantra-Trace] TTS_COMPLETED`);
-    if (speakerIndicator) {
-      speakerIndicator.textContent = 'SPEAKER IDLE';
-      speakerIndicator.style.color = '#06b6d4';
+    // Voice selection: use pre-cached list (populated via voiceschanged event in initTTS).
+    // Priority: exact BCP-47 match (e.g. 'te-IN') → language-prefix match (e.g. 'te') → browser default.
+    const voices = state.voicesCache.length > 0 ? state.voicesCache : state.speechSynth.getVoices();
+    const exactVoice = voices.find(v => v.lang === targetLang);
+    const prefixVoice = voices.find(v => v.lang.startsWith(targetLang.substring(0, 2)));
+    if (exactVoice) {
+      utterance.voice = exactVoice;
+    } else if (prefixVoice) {
+      utterance.voice = prefixVoice;
     }
-  };
+    // If no matching voice: browser uses its default — do NOT throw an error.
 
-  utterance.onerror = () => {
-    state.isSpeaking = false;
-    state.isAlertPlaying = false;
-    console.log(`[iTantra-Trace] TTS_COMPLETED (with error/aborted)`);
-    if (speakerIndicator) {
-      speakerIndicator.textContent = 'SPEAKER IDLE';
-      speakerIndicator.style.color = '#06b6d4';
+    console.log(`[iTantra-Trace] TTS_STARTED (text="${cleanText}", lang=${utterance.lang}, voice=${utterance.voice?.name || 'browser-default'})`);
+
+    utterance.onstart = () => {
+      state.isSpeaking = true;
+      console.log('[iTantra-Trace] TTS_SPEAKING_STARTED');
+      if (speakerIndicator) {
+        speakerIndicator.textContent = isAlertOrSos ? '🚨 VOCALIZING EMERGENCY ALERT (MAX VOL)' : '🔊 SPEAKING…';
+        speakerIndicator.style.color = isAlertOrSos ? '#ef4444' : '#10b981';
+      }
+    };
+
+    utterance.onend = () => {
+      state.isSpeaking = false;
+      state.isAlertPlaying = false;
+      console.log('[iTantra-Trace] TTS_COMPLETED');
+      if (speakerIndicator) {
+        speakerIndicator.textContent = 'SPEAKER IDLE';
+        speakerIndicator.style.color = '#06b6d4';
+      }
+    };
+
+    utterance.onerror = (e) => {
+      state.isSpeaking = false;
+      state.isAlertPlaying = false;
+      // 'interrupted' is normal when cancel() is called — not a real error
+      if (e.error !== 'interrupted') {
+        console.warn(`[iTantra-Trace] TTS_ERROR (error=${e.error})`);
+      }
+      if (speakerIndicator) {
+        speakerIndicator.textContent = 'SPEAKER IDLE';
+        speakerIndicator.style.color = '#06b6d4';
+      }
+    };
+
+    try {
+      state.speechSynth.speak(utterance);
+    } catch (err) {
+      console.error('[iTantra-TTS] speak() threw:', err);
+      state.isSpeaking = false;
+      state.isAlertPlaying = false;
+      if (speakerIndicator) {
+        speakerIndicator.textContent = 'SPEAKER IDLE';
+        speakerIndicator.style.color = '#06b6d4';
+      }
     }
-  };
-
-  state.speechSynth.speak(utterance);
+  }, 120);
 }
 
 // =============================================================================
